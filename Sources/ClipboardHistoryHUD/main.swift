@@ -828,9 +828,9 @@ private final class ClipboardHistoryStore {
     }
 
     func delete(_ item: ClipboardItem) {
-        items.removeAll { $0.id == item.id }
-        persistence.delete(item)
-        persistence.updateListMetadata(items)
+        guard let deletedIndex = items.firstIndex(where: { $0.id == item.id }) else { return }
+        items.remove(at: deletedIndex)
+        persistence.delete(item, remainingItems: items, fromPosition: deletedIndex)
     }
 
     func clear() {
@@ -952,7 +952,7 @@ private final class ClipboardHistoryPersistence {
         }
     }
 
-    func delete(_ item: ClipboardItem) {
+    func delete(_ item: ClipboardItem, remainingItems: [ClipboardItem], fromPosition deletedPosition: Int) {
         guard let db else { return }
         deleteImageFile(for: item.id)
         let sql = "DELETE FROM clipboard_items WHERE id = ?;"
@@ -963,11 +963,15 @@ private final class ClipboardHistoryPersistence {
         }
         defer { sqlite3_finalize(statement) }
 
+        exec("BEGIN IMMEDIATE TRANSACTION;")
         bindText(item.id.uuidString, to: 1, in: statement)
         guard sqlite3_step(statement) == SQLITE_DONE else {
             logSQLiteError("Failed to delete history item")
+            exec("ROLLBACK;")
             return
         }
+        updatePositions(remainingItems, startingAt: deletedPosition)
+        exec("COMMIT;")
     }
 
     func clear() {
@@ -1142,7 +1146,12 @@ private final class ClipboardHistoryPersistence {
     }
 
     private func updatePositions(_ items: [ClipboardItem]) {
+        updatePositions(items, startingAt: 0)
+    }
+
+    private func updatePositions(_ items: [ClipboardItem], startingAt startIndex: Int) {
         guard let db else { return }
+        guard items.indices.contains(startIndex) else { return }
         let sql = "UPDATE clipboard_items SET pinned = ?, position = ? WHERE id = ?;"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -1151,7 +1160,8 @@ private final class ClipboardHistoryPersistence {
         }
         defer { sqlite3_finalize(statement) }
 
-        for (position, item) in items.enumerated() {
+        for position in startIndex..<items.count {
+            let item = items[position]
             sqlite3_reset(statement)
             sqlite3_clear_bindings(statement)
             sqlite3_bind_int(statement, 1, item.isPinned ? 1 : 0)
