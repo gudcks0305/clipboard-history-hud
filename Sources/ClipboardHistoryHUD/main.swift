@@ -872,6 +872,10 @@ private final class ClipboardHistoryPersistence {
         historyDirectory.appendingPathComponent("history.sqlite3")
     }
 
+    private var imageDirectory: URL {
+        historyDirectory.appendingPathComponent("images", isDirectory: true)
+    }
+
     private var legacyJSONURL: URL {
         historyDirectory.appendingPathComponent("history.json")
     }
@@ -881,7 +885,7 @@ private final class ClipboardHistoryPersistence {
 
         let sql = """
         SELECT id, kind, title, detail, created_at, signature, text, url_string,
-               image_data, image_type, pinned, source_app_name, source_bundle_id, ocr_text
+               image_data, image_type, pinned, source_app_name, source_bundle_id, ocr_text, image_file
         FROM clipboard_items
         ORDER BY position ASC
         LIMIT ?;
@@ -916,7 +920,6 @@ private final class ClipboardHistoryPersistence {
         updatePositions(items)
         clearImagesNotAllowed(allowedImageIDs)
         exec("COMMIT;")
-        checkpoint()
     }
 
     func updateListMetadata(_ items: [ClipboardItem]) {
@@ -927,7 +930,6 @@ private final class ClipboardHistoryPersistence {
         updatePositions(items)
         clearImagesNotAllowed(allowedImageIDs)
         exec("COMMIT;")
-        checkpoint()
     }
 
     func updateOCRText(forID id: UUID, signature: String, text: String) {
@@ -948,11 +950,11 @@ private final class ClipboardHistoryPersistence {
             logSQLiteError("Failed to update OCR text")
             return
         }
-        checkpoint()
     }
 
     func delete(_ item: ClipboardItem) {
         guard let db else { return }
+        deleteImageFile(for: item.id)
         let sql = "DELETE FROM clipboard_items WHERE id = ?;"
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -966,11 +968,11 @@ private final class ClipboardHistoryPersistence {
             logSQLiteError("Failed to delete history item")
             return
         }
-        checkpoint()
     }
 
     func clear() {
         exec("DELETE FROM clipboard_items;")
+        deleteAllImageFiles()
         checkpoint()
     }
 
@@ -979,10 +981,13 @@ private final class ClipboardHistoryPersistence {
         let allowedImageIDs = allowedPersistedImageIDs(in: items)
         exec("BEGIN IMMEDIATE TRANSACTION;")
         deleteRowsNotIn(items)
+        for (position, item) in items.enumerated() {
+            upsert(item, position: position, persistImage: allowedImageIDs.contains(item.id))
+        }
         updatePositions(items)
         clearImagesNotAllowed(allowedImageIDs)
         exec("COMMIT;")
-        checkpoint()
+        passiveCheckpoint()
         exec("VACUUM;")
         checkpoint()
     }
@@ -997,8 +1002,8 @@ private final class ClipboardHistoryPersistence {
         let sql = """
         INSERT INTO clipboard_items (
             id, kind, title, detail, created_at, signature, text, url_string,
-            image_data, image_type, pinned, source_app_name, source_bundle_id, ocr_text, position
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            image_data, image_type, image_file, pinned, source_app_name, source_bundle_id, ocr_text, position
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
 
         var statement: OpaquePointer?
@@ -1013,7 +1018,7 @@ private final class ClipboardHistoryPersistence {
             guard let record = PersistedClipboardItem(
                 item: item,
                 maxImageBytes: maxPersistedImageBytes,
-                persistImage: allowedImageIDs.contains(item.id)
+                imageFile: persistImageFile(for: item, persistImage: allowedImageIDs.contains(item.id))
             ) else {
                 continue
             }
@@ -1031,7 +1036,7 @@ private final class ClipboardHistoryPersistence {
         }
 
         exec("COMMIT;")
-        checkpoint()
+        passiveCheckpoint()
     }
 
     private func allowedPersistedImageIDs(in items: [ClipboardItem]) -> Set<UUID> {
@@ -1093,7 +1098,7 @@ private final class ClipboardHistoryPersistence {
               let record = PersistedClipboardItem(
                   item: item,
                   maxImageBytes: maxPersistedImageBytes,
-                  persistImage: persistImage
+                  imageFile: persistImageFile(for: item, persistImage: persistImage)
               )
         else {
             return
@@ -1102,8 +1107,8 @@ private final class ClipboardHistoryPersistence {
         let sql = """
         INSERT INTO clipboard_items (
             id, kind, title, detail, created_at, signature, text, url_string,
-            image_data, image_type, pinned, source_app_name, source_bundle_id, ocr_text, position
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            image_data, image_type, image_file, pinned, source_app_name, source_bundle_id, ocr_text, position
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             kind = excluded.kind,
             title = excluded.title,
@@ -1114,6 +1119,7 @@ private final class ClipboardHistoryPersistence {
             url_string = excluded.url_string,
             image_data = excluded.image_data,
             image_type = excluded.image_type,
+            image_file = excluded.image_file,
             pinned = excluded.pinned,
             source_app_name = excluded.source_app_name,
             source_bundle_id = excluded.source_bundle_id,
@@ -1160,16 +1166,82 @@ private final class ClipboardHistoryPersistence {
 
     private func clearImagesNotAllowed(_ allowedImageIDs: Set<UUID>) {
         if allowedImageIDs.isEmpty {
-            exec("UPDATE clipboard_items SET image_data = NULL, image_type = NULL WHERE image_data IS NOT NULL;")
+            exec("UPDATE clipboard_items SET image_data = NULL, image_type = NULL, image_file = NULL WHERE image_data IS NOT NULL OR image_file IS NOT NULL;")
+            deleteAllImageFiles()
             return
         }
 
         let ids = allowedImageIDs.map { "'\($0.uuidString)'" }.joined(separator: ",")
-        exec("UPDATE clipboard_items SET image_data = NULL, image_type = NULL WHERE image_data IS NOT NULL AND id NOT IN (\(ids));")
+        exec("UPDATE clipboard_items SET image_data = NULL, image_type = NULL, image_file = NULL WHERE id NOT IN (\(ids));")
+        deleteImageFilesNotIn(allowedImageIDs)
+    }
+
+    private func persistImageFile(for item: ClipboardItem, persistImage: Bool) -> String? {
+        guard persistImage,
+              let data = item.imageData,
+              data.count <= maxPersistedImageBytes,
+              let extensionName = fileExtension(for: item.imageType)
+        else {
+            return nil
+        }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: imageDirectory,
+                withIntermediateDirectories: true
+            )
+            let fileName = "\(item.id.uuidString).\(extensionName)"
+            let url = imageDirectory.appendingPathComponent(fileName)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                try data.write(to: url, options: .atomic)
+            }
+            return fileName
+        } catch {
+            log("Failed to persist clipboard image file: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func readImageFile(_ fileName: String?) -> Data? {
+        guard let fileName, !fileName.isEmpty else { return nil }
+        return try? Data(contentsOf: imageDirectory.appendingPathComponent(fileName))
+    }
+
+    private func deleteImageFile(for id: UUID) {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: imageDirectory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+        for file in files where file.deletingPathExtension().lastPathComponent == id.uuidString {
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+
+    private func deleteImageFilesNotIn(_ allowedImageIDs: Set<UUID>) {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: imageDirectory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+        let allowed = Set(allowedImageIDs.map(\.uuidString))
+        for file in files where !allowed.contains(file.deletingPathExtension().lastPathComponent) {
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+
+    private func deleteAllImageFiles() {
+        try? FileManager.default.removeItem(at: imageDirectory)
     }
 
     private func checkpoint() {
         exec("PRAGMA wal_checkpoint(TRUNCATE);")
+    }
+
+    private func passiveCheckpoint() {
+        exec("PRAGMA wal_checkpoint(PASSIVE);")
     }
 
     private func openDatabase() {
@@ -1192,6 +1264,8 @@ private final class ClipboardHistoryPersistence {
 
         exec("PRAGMA journal_mode=WAL;")
         exec("PRAGMA synchronous=NORMAL;")
+        exec("PRAGMA wal_autocheckpoint=8192;")
+        exec("PRAGMA journal_size_limit=33554432;")
     }
 
     private func ensureSchema() {
@@ -1207,6 +1281,7 @@ private final class ClipboardHistoryPersistence {
             url_string TEXT,
             image_data BLOB,
             image_type TEXT,
+            image_file TEXT,
             pinned INTEGER NOT NULL DEFAULT 0,
             source_app_name TEXT,
             source_bundle_id TEXT,
@@ -1218,6 +1293,7 @@ private final class ClipboardHistoryPersistence {
         addColumnIfMissing("source_app_name", definition: "TEXT")
         addColumnIfMissing("source_bundle_id", definition: "TEXT")
         addColumnIfMissing("ocr_text", definition: "TEXT")
+        addColumnIfMissing("image_file", definition: "TEXT")
         exec("CREATE INDEX IF NOT EXISTS idx_clipboard_items_signature ON clipboard_items(signature);")
         exec("CREATE INDEX IF NOT EXISTS idx_clipboard_items_position ON clipboard_items(position);")
     }
@@ -1287,7 +1363,7 @@ private final class ClipboardHistoryPersistence {
             return nil
         }
 
-        let imageData = columnBlob(statement, 8)
+        let imageData = columnBlob(statement, 8) ?? readImageFile(columnText(statement, 14))
         return ClipboardItem(
             id: id,
             kind: kind,
@@ -1323,13 +1399,14 @@ private final class ClipboardHistoryPersistence {
         bindText(record.signature, to: 6, in: statement)
         bindOptionalText(record.text, to: 7, in: statement)
         bindOptionalText(record.urlString, to: 8, in: statement)
-        bindOptionalBlob(record.imageData, to: 9, in: statement)
+        sqlite3_bind_null(statement, 9)
         bindOptionalText(record.imageTypeRawValue, to: 10, in: statement)
-        sqlite3_bind_int(statement, 11, record.isPinned == true ? 1 : 0)
-        bindOptionalText(record.sourceAppName, to: 12, in: statement)
-        bindOptionalText(record.sourceBundleIdentifier, to: 13, in: statement)
-        bindOptionalText(record.ocrText, to: 14, in: statement)
-        sqlite3_bind_int(statement, 15, Int32(position))
+        bindOptionalText(record.imageFile, to: 11, in: statement)
+        sqlite3_bind_int(statement, 12, record.isPinned == true ? 1 : 0)
+        bindOptionalText(record.sourceAppName, to: 13, in: statement)
+        bindOptionalText(record.sourceBundleIdentifier, to: 14, in: statement)
+        bindOptionalText(record.ocrText, to: 15, in: statement)
+        sqlite3_bind_int(statement, 16, Int32(position))
     }
 
     private func bindText(_ value: String, to index: Int32, in statement: OpaquePointer?) {
@@ -1399,8 +1476,9 @@ private struct PersistedClipboardItem: Codable {
     let urlString: String?
     let imageData: Data?
     let imageTypeRawValue: String?
+    let imageFile: String?
 
-    init?(item: ClipboardItem, maxImageBytes: Int, persistImage: Bool = true) {
+    init?(item: ClipboardItem, maxImageBytes: Int, imageFile: String? = nil) {
         id = item.id
         kind = item.kind
         title = item.title
@@ -1413,11 +1491,9 @@ private struct PersistedClipboardItem: Codable {
         ocrText = item.ocrText
         text = item.text
         urlString = item.url?.absoluteString
-        let shouldPersistImage = persistImage
-            && item.imageData != nil
-            && (item.imageData?.count ?? 0) <= maxImageBytes
-        imageData = shouldPersistImage ? item.imageData : nil
-        imageTypeRawValue = shouldPersistImage ? item.imageType?.rawValue : nil
+        imageData = nil
+        imageTypeRawValue = imageFile == nil ? nil : item.imageType?.rawValue
+        self.imageFile = imageFile
     }
 
     var clipboardItem: ClipboardItem? {
@@ -1447,6 +1523,10 @@ private struct PersistedClipboardItem: Codable {
 
 private enum ClipboardReader {
     static func read(from pasteboard: NSPasteboard, source: SourceApplication?) -> ClipboardItem? {
+        if let fileURL = readURLObject(from: pasteboard), fileURL.isFileURL {
+            return item(for: fileURL, source: source)
+        }
+
         if let image = readImage(from: pasteboard, source: source) {
             return image
         }

@@ -71,11 +71,13 @@ rm "$HOME/Library/LaunchAgents/com.local.clipboard-history-hud.plist"
 ## Privacy
 
 History and OCR text are stored locally in
-`~/Library/Application Support/ClipboardHistoryHUD/history.sqlite3`. Existing
-`history.json` files are migrated on first launch. By default, image payloads
-are persisted only when each image is 3 MB or smaller, up to 30 images and 32 MB
-total. Larger or older images still appear as history metadata, but their image
-payload is not kept in SQLite.
+`~/Library/Application Support/ClipboardHistoryHUD/history.sqlite3`. Image
+payloads are stored as files under
+`~/Library/Application Support/ClipboardHistoryHUD/images/`, with SQLite keeping
+only the relative file name. Existing `history.json` files are migrated on first
+launch. By default, image payloads are persisted only when each image is 3 MB or
+smaller, up to 30 images and 32 MB total. Larger or older images still appear as
+history metadata, but their image payload is not kept.
 
 ## Configuration
 
