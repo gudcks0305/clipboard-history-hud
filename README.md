@@ -72,8 +72,10 @@ rm "$HOME/Library/LaunchAgents/com.local.clipboard-history-hud.plist"
 
 History and OCR text are stored locally in
 `~/Library/Application Support/ClipboardHistoryHUD/history.sqlite3`. Existing
-`history.json` files are migrated on first launch. Image entries larger than 8
-MB are not persisted.
+`history.json` files are migrated on first launch. By default, image payloads
+are persisted only when each image is 3 MB or smaller, up to 30 images and 32 MB
+total. Larger or older images still appear as history metadata, but their image
+payload is not kept in SQLite.
 
 ## Configuration
 
@@ -82,7 +84,9 @@ Optional config file:
 ```json
 {
   "historyLimit": 200,
-  "maxPersistedImageBytes": 8388608,
+  "maxPersistedImageBytes": 3145728,
+  "maxPersistedImages": 30,
+  "maxPersistedImageTotalBytes": 33554432,
   "hotKey": {
     "key": "v",
     "modifiers": ["command", "shift"]

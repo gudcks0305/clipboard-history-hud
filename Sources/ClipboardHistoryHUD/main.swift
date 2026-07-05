@@ -24,13 +24,49 @@ private let handledSearchCommands: Set<Selector> = [
 private struct AppConfig: Decodable {
     let historyLimit: Int
     let maxPersistedImageBytes: Int
+    let maxPersistedImages: Int
+    let maxPersistedImageTotalBytes: Int
     let hotKey: HotKeyConfig
 
     static let `default` = AppConfig(
         historyLimit: 200,
-        maxPersistedImageBytes: 8 * 1024 * 1024,
+        maxPersistedImageBytes: 3 * 1024 * 1024,
+        maxPersistedImages: 30,
+        maxPersistedImageTotalBytes: 32 * 1024 * 1024,
         hotKey: HotKeyConfig(key: "v", modifiers: ["command", "shift"])
     )
+
+    private enum CodingKeys: String, CodingKey {
+        case historyLimit
+        case maxPersistedImageBytes
+        case maxPersistedImages
+        case maxPersistedImageTotalBytes
+        case hotKey
+    }
+
+    init(
+        historyLimit: Int,
+        maxPersistedImageBytes: Int,
+        maxPersistedImages: Int,
+        maxPersistedImageTotalBytes: Int,
+        hotKey: HotKeyConfig
+    ) {
+        self.historyLimit = historyLimit
+        self.maxPersistedImageBytes = maxPersistedImageBytes
+        self.maxPersistedImages = maxPersistedImages
+        self.maxPersistedImageTotalBytes = maxPersistedImageTotalBytes
+        self.hotKey = hotKey
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = Self.default
+        historyLimit = try container.decodeIfPresent(Int.self, forKey: .historyLimit) ?? defaults.historyLimit
+        maxPersistedImageBytes = try container.decodeIfPresent(Int.self, forKey: .maxPersistedImageBytes) ?? defaults.maxPersistedImageBytes
+        maxPersistedImages = try container.decodeIfPresent(Int.self, forKey: .maxPersistedImages) ?? defaults.maxPersistedImages
+        maxPersistedImageTotalBytes = try container.decodeIfPresent(Int.self, forKey: .maxPersistedImageTotalBytes) ?? defaults.maxPersistedImageTotalBytes
+        hotKey = try container.decodeIfPresent(HotKeyConfig.self, forKey: .hotKey) ?? defaults.hotKey
+    }
 
     static func load() -> AppConfig {
         let url = FileManager.default
@@ -46,6 +82,8 @@ private struct AppConfig: Decodable {
         return AppConfig(
             historyLimit: max(20, min(config.historyLimit, 1000)),
             maxPersistedImageBytes: max(0, min(config.maxPersistedImageBytes, 50 * 1024 * 1024)),
+            maxPersistedImages: max(0, min(config.maxPersistedImages, 500)),
+            maxPersistedImageTotalBytes: max(0, min(config.maxPersistedImageTotalBytes, 512 * 1024 * 1024)),
             hotKey: config.hotKey
         )
     }
@@ -146,7 +184,9 @@ private final class ClipboardHistoryApp: @unchecked Sendable {
         config = AppConfig.load()
         store = ClipboardHistoryStore(
             limit: config.historyLimit,
-            maxPersistedImageBytes: config.maxPersistedImageBytes
+            maxPersistedImageBytes: config.maxPersistedImageBytes,
+            maxPersistedImages: config.maxPersistedImages,
+            maxPersistedImageTotalBytes: config.maxPersistedImageTotalBytes
         )
     }
 
@@ -717,10 +757,20 @@ private final class ClipboardHistoryStore {
     private let persistence: ClipboardHistoryPersistence
     private(set) var items: [ClipboardItem]
 
-    init(limit: Int, maxPersistedImageBytes: Int) {
+    init(
+        limit: Int,
+        maxPersistedImageBytes: Int,
+        maxPersistedImages: Int,
+        maxPersistedImageTotalBytes: Int
+    ) {
         self.limit = limit
-        persistence = ClipboardHistoryPersistence(maxPersistedImageBytes: maxPersistedImageBytes)
+        persistence = ClipboardHistoryPersistence(
+            maxPersistedImageBytes: maxPersistedImageBytes,
+            maxPersistedImages: maxPersistedImages,
+            maxPersistedImageTotalBytes: maxPersistedImageTotalBytes
+        )
         items = persistence.load(limit: limit)
+        persistence.compact(items)
     }
 
     func add(_ item: ClipboardItem) {
@@ -750,21 +800,21 @@ private final class ClipboardHistoryStore {
             items.removeLast(items.count - limit)
         }
 
-        persistence.save(items)
+        persistence.persistListChange(items, changedItem: item)
     }
 
     func promote(_ item: ClipboardItem) {
         guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
         let item = items.remove(at: index)
         items.insert(item, at: item.isPinned ? 0 : firstUnpinnedIndex())
-        persistence.save(items)
+        persistence.updateListMetadata(items)
     }
 
     func togglePin(_ item: ClipboardItem) {
         guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
         let toggled = items.remove(at: index).pinnedToggled
         items.insert(toggled, at: toggled.isPinned ? 0 : firstUnpinnedIndex())
-        persistence.save(items)
+        persistence.updateListMetadata(items)
     }
 
     func updateOCRText(forID id: UUID, signature: String, text: String) -> Bool {
@@ -773,18 +823,19 @@ private final class ClipboardHistoryStore {
         }
 
         items[index] = items[index].withOCRText(text)
-        persistence.save(items)
+        persistence.updateOCRText(forID: id, signature: signature, text: text)
         return true
     }
 
     func delete(_ item: ClipboardItem) {
         items.removeAll { $0.id == item.id }
-        persistence.save(items)
+        persistence.delete(item)
+        persistence.updateListMetadata(items)
     }
 
     func clear() {
         items.removeAll()
-        persistence.save(items)
+        persistence.clear()
     }
 
     private func firstUnpinnedIndex() -> Int {
@@ -794,10 +845,14 @@ private final class ClipboardHistoryStore {
 
 private final class ClipboardHistoryPersistence {
     private let maxPersistedImageBytes: Int
+    private let maxPersistedImages: Int
+    private let maxPersistedImageTotalBytes: Int
     private var db: OpaquePointer?
 
-    init(maxPersistedImageBytes: Int) {
+    init(maxPersistedImageBytes: Int, maxPersistedImages: Int, maxPersistedImageTotalBytes: Int) {
         self.maxPersistedImageBytes = maxPersistedImageBytes
+        self.maxPersistedImages = maxPersistedImages
+        self.maxPersistedImageTotalBytes = maxPersistedImageTotalBytes
         openDatabase()
         ensureSchema()
         migrateJSONIfNeeded()
@@ -849,8 +904,92 @@ private final class ClipboardHistoryPersistence {
         return items
     }
 
+    func persistListChange(_ items: [ClipboardItem], changedItem: ClipboardItem) {
+        guard db != nil else { return }
+        let allowedImageIDs = allowedPersistedImageIDs(in: items)
+        let position = items.firstIndex { $0.id == changedItem.id } ?? 0
+
+        exec("BEGIN IMMEDIATE TRANSACTION;")
+        deleteRowsNotIn(items)
+        deleteDuplicateSignature(changedItem.signature, excludingID: changedItem.id)
+        upsert(changedItem, position: position, persistImage: allowedImageIDs.contains(changedItem.id))
+        updatePositions(items)
+        clearImagesNotAllowed(allowedImageIDs)
+        exec("COMMIT;")
+        checkpoint()
+    }
+
+    func updateListMetadata(_ items: [ClipboardItem]) {
+        guard db != nil else { return }
+        let allowedImageIDs = allowedPersistedImageIDs(in: items)
+        exec("BEGIN IMMEDIATE TRANSACTION;")
+        deleteRowsNotIn(items)
+        updatePositions(items)
+        clearImagesNotAllowed(allowedImageIDs)
+        exec("COMMIT;")
+        checkpoint()
+    }
+
+    func updateOCRText(forID id: UUID, signature: String, text: String) {
+        guard let db else { return }
+        let sql = "UPDATE clipboard_items SET ocr_text = ? WHERE id = ? AND signature = ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            logSQLiteError("Failed to prepare OCR update")
+            return
+        }
+        defer { sqlite3_finalize(statement) }
+
+        bindText(text, to: 1, in: statement)
+        bindText(id.uuidString, to: 2, in: statement)
+        bindText(signature, to: 3, in: statement)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            logSQLiteError("Failed to update OCR text")
+            return
+        }
+        checkpoint()
+    }
+
+    func delete(_ item: ClipboardItem) {
+        guard let db else { return }
+        let sql = "DELETE FROM clipboard_items WHERE id = ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            logSQLiteError("Failed to prepare history delete")
+            return
+        }
+        defer { sqlite3_finalize(statement) }
+
+        bindText(item.id.uuidString, to: 1, in: statement)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            logSQLiteError("Failed to delete history item")
+            return
+        }
+        checkpoint()
+    }
+
+    func clear() {
+        exec("DELETE FROM clipboard_items;")
+        checkpoint()
+    }
+
+    func compact(_ items: [ClipboardItem]) {
+        guard db != nil else { return }
+        let allowedImageIDs = allowedPersistedImageIDs(in: items)
+        exec("BEGIN IMMEDIATE TRANSACTION;")
+        deleteRowsNotIn(items)
+        updatePositions(items)
+        clearImagesNotAllowed(allowedImageIDs)
+        exec("COMMIT;")
+        checkpoint()
+        exec("VACUUM;")
+        checkpoint()
+    }
+
     func save(_ items: [ClipboardItem]) {
         guard let db else { return }
+        let allowedImageIDs = allowedPersistedImageIDs(in: items)
 
         exec("BEGIN IMMEDIATE TRANSACTION;")
         exec("DELETE FROM clipboard_items;")
@@ -871,28 +1010,18 @@ private final class ClipboardHistoryPersistence {
         defer { sqlite3_finalize(statement) }
 
         for (position, item) in items.enumerated() {
-            guard let record = PersistedClipboardItem(item: item, maxImageBytes: maxPersistedImageBytes) else {
+            guard let record = PersistedClipboardItem(
+                item: item,
+                maxImageBytes: maxPersistedImageBytes,
+                persistImage: allowedImageIDs.contains(item.id)
+            ) else {
                 continue
             }
 
             sqlite3_reset(statement)
             sqlite3_clear_bindings(statement)
 
-            bindText(record.id.uuidString, to: 1, in: statement)
-            bindText(record.kind.rawValue, to: 2, in: statement)
-            bindText(record.title, to: 3, in: statement)
-            bindText(record.detail, to: 4, in: statement)
-            sqlite3_bind_double(statement, 5, record.createdAt.timeIntervalSince1970)
-            bindText(record.signature, to: 6, in: statement)
-            bindOptionalText(record.text, to: 7, in: statement)
-            bindOptionalText(record.urlString, to: 8, in: statement)
-            bindOptionalBlob(record.imageData, to: 9, in: statement)
-            bindOptionalText(record.imageTypeRawValue, to: 10, in: statement)
-            sqlite3_bind_int(statement, 11, record.isPinned == true ? 1 : 0)
-            bindOptionalText(record.sourceAppName, to: 12, in: statement)
-            bindOptionalText(record.sourceBundleIdentifier, to: 13, in: statement)
-            bindOptionalText(record.ocrText, to: 14, in: statement)
-            sqlite3_bind_int(statement, 15, Int32(position))
+            bind(record, position: position, to: statement)
 
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 logSQLiteError("Failed to insert history item")
@@ -902,6 +1031,145 @@ private final class ClipboardHistoryPersistence {
         }
 
         exec("COMMIT;")
+        checkpoint()
+    }
+
+    private func allowedPersistedImageIDs(in items: [ClipboardItem]) -> Set<UUID> {
+        guard maxPersistedImages > 0, maxPersistedImageTotalBytes > 0, maxPersistedImageBytes > 0 else {
+            return []
+        }
+
+        var allowed: Set<UUID> = []
+        var imageCount = 0
+        var byteCount = 0
+
+        for item in items where item.kind == .image {
+            guard let size = item.imageData?.count,
+                  size > 0,
+                  size <= maxPersistedImageBytes,
+                  imageCount < maxPersistedImages,
+                  byteCount + size <= maxPersistedImageTotalBytes
+            else {
+                continue
+            }
+            allowed.insert(item.id)
+            imageCount += 1
+            byteCount += size
+        }
+
+        return allowed
+    }
+
+    private func deleteRowsNotIn(_ items: [ClipboardItem]) {
+        if items.isEmpty {
+            exec("DELETE FROM clipboard_items;")
+            return
+        }
+
+        let ids = items.map { "'\($0.id.uuidString)'" }.joined(separator: ",")
+        exec("DELETE FROM clipboard_items WHERE id NOT IN (\(ids));")
+    }
+
+    private func deleteDuplicateSignature(_ signature: String, excludingID id: UUID) {
+        guard let db else { return }
+        let sql = "DELETE FROM clipboard_items WHERE signature = ? AND id <> ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            logSQLiteError("Failed to prepare duplicate delete")
+            return
+        }
+        defer { sqlite3_finalize(statement) }
+
+        bindText(signature, to: 1, in: statement)
+        bindText(id.uuidString, to: 2, in: statement)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            logSQLiteError("Failed to delete duplicate history item")
+            return
+        }
+    }
+
+    private func upsert(_ item: ClipboardItem, position: Int, persistImage: Bool) {
+        guard let db,
+              let record = PersistedClipboardItem(
+                  item: item,
+                  maxImageBytes: maxPersistedImageBytes,
+                  persistImage: persistImage
+              )
+        else {
+            return
+        }
+
+        let sql = """
+        INSERT INTO clipboard_items (
+            id, kind, title, detail, created_at, signature, text, url_string,
+            image_data, image_type, pinned, source_app_name, source_bundle_id, ocr_text, position
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            kind = excluded.kind,
+            title = excluded.title,
+            detail = excluded.detail,
+            created_at = excluded.created_at,
+            signature = excluded.signature,
+            text = excluded.text,
+            url_string = excluded.url_string,
+            image_data = excluded.image_data,
+            image_type = excluded.image_type,
+            pinned = excluded.pinned,
+            source_app_name = excluded.source_app_name,
+            source_bundle_id = excluded.source_bundle_id,
+            ocr_text = excluded.ocr_text,
+            position = excluded.position;
+        """
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            logSQLiteError("Failed to prepare history upsert")
+            return
+        }
+        defer { sqlite3_finalize(statement) }
+
+        bind(record, position: position, to: statement)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            logSQLiteError("Failed to upsert history item")
+            return
+        }
+    }
+
+    private func updatePositions(_ items: [ClipboardItem]) {
+        guard let db else { return }
+        let sql = "UPDATE clipboard_items SET pinned = ?, position = ? WHERE id = ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            logSQLiteError("Failed to prepare position update")
+            return
+        }
+        defer { sqlite3_finalize(statement) }
+
+        for (position, item) in items.enumerated() {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            sqlite3_bind_int(statement, 1, item.isPinned ? 1 : 0)
+            sqlite3_bind_int(statement, 2, Int32(position))
+            bindText(item.id.uuidString, to: 3, in: statement)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                logSQLiteError("Failed to update history position")
+                return
+            }
+        }
+    }
+
+    private func clearImagesNotAllowed(_ allowedImageIDs: Set<UUID>) {
+        if allowedImageIDs.isEmpty {
+            exec("UPDATE clipboard_items SET image_data = NULL, image_type = NULL WHERE image_data IS NOT NULL;")
+            return
+        }
+
+        let ids = allowedImageIDs.map { "'\($0.uuidString)'" }.joined(separator: ",")
+        exec("UPDATE clipboard_items SET image_data = NULL, image_type = NULL WHERE image_data IS NOT NULL AND id NOT IN (\(ids));")
+    }
+
+    private func checkpoint() {
+        exec("PRAGMA wal_checkpoint(TRUNCATE);")
     }
 
     private func openDatabase() {
@@ -1046,6 +1314,24 @@ private final class ClipboardHistoryPersistence {
         }
     }
 
+    private func bind(_ record: PersistedClipboardItem, position: Int, to statement: OpaquePointer?) {
+        bindText(record.id.uuidString, to: 1, in: statement)
+        bindText(record.kind.rawValue, to: 2, in: statement)
+        bindText(record.title, to: 3, in: statement)
+        bindText(record.detail, to: 4, in: statement)
+        sqlite3_bind_double(statement, 5, record.createdAt.timeIntervalSince1970)
+        bindText(record.signature, to: 6, in: statement)
+        bindOptionalText(record.text, to: 7, in: statement)
+        bindOptionalText(record.urlString, to: 8, in: statement)
+        bindOptionalBlob(record.imageData, to: 9, in: statement)
+        bindOptionalText(record.imageTypeRawValue, to: 10, in: statement)
+        sqlite3_bind_int(statement, 11, record.isPinned == true ? 1 : 0)
+        bindOptionalText(record.sourceAppName, to: 12, in: statement)
+        bindOptionalText(record.sourceBundleIdentifier, to: 13, in: statement)
+        bindOptionalText(record.ocrText, to: 14, in: statement)
+        sqlite3_bind_int(statement, 15, Int32(position))
+    }
+
     private func bindText(_ value: String, to index: Int32, in statement: OpaquePointer?) {
         sqlite3_bind_text(statement, index, value, -1, sqliteTransient)
     }
@@ -1114,11 +1400,7 @@ private struct PersistedClipboardItem: Codable {
     let imageData: Data?
     let imageTypeRawValue: String?
 
-    init?(item: ClipboardItem, maxImageBytes: Int) {
-        if let imageData = item.imageData, imageData.count > maxImageBytes {
-            return nil
-        }
-
+    init?(item: ClipboardItem, maxImageBytes: Int, persistImage: Bool = true) {
         id = item.id
         kind = item.kind
         title = item.title
@@ -1131,8 +1413,11 @@ private struct PersistedClipboardItem: Codable {
         ocrText = item.ocrText
         text = item.text
         urlString = item.url?.absoluteString
-        imageData = item.imageData
-        imageTypeRawValue = item.imageType?.rawValue
+        let shouldPersistImage = persistImage
+            && item.imageData != nil
+            && (item.imageData?.count ?? 0) <= maxImageBytes
+        imageData = shouldPersistImage ? item.imageData : nil
+        imageTypeRawValue = shouldPersistImage ? item.imageType?.rawValue : nil
     }
 
     var clipboardItem: ClipboardItem? {
